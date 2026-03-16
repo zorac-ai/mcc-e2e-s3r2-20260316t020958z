@@ -529,11 +529,13 @@ class CollabServer:
                     ).encode()
                 )
                 client_id = str(uuid.uuid4())
+                send_lock = threading.Lock()
                 with self._lock:
                     self._clients[client_id] = conn
-                    self._client_send_locks[client_id] = threading.Lock()
+                    self._client_send_locks[client_id] = send_lock
                 self._on_ws_open(client_id)
-                self._ws_loop(conn, client_id)
+                conn.settimeout(None)
+                self._ws_loop(conn, client_id, send_lock)
             else:
                 # Plain HTTP – serve editor page
                 body = _HTML_CLIENT.encode("utf-8")
@@ -568,7 +570,7 @@ class CollabServer:
             "cursors": cursors,
         })
 
-    def _ws_loop(self, conn: socket.socket, client_id: str) -> None:
+    def _ws_loop(self, conn: socket.socket, client_id: str, send_lock: threading.Lock) -> None:
         buf = b""
         while True:
             try:
@@ -587,7 +589,8 @@ class CollabServer:
                     return
                 if opcode == _OP_PING:
                     try:
-                        conn.sendall(_make_frame(_OP_PONG, payload))
+                        with send_lock:
+                            conn.sendall(_make_frame(_OP_PONG, payload))
                     except OSError:
                         return
                 elif opcode == _OP_TEXT:
@@ -615,7 +618,10 @@ class CollabServer:
                 self._broadcast({"type": "insert", "atom": atom.to_dict()}, exclude=client_id)
 
         elif kind == "delete":
-            uid = (msg["uid"][0], msg["uid"][1])
+            raw_uid = msg.get("uid")
+            if not isinstance(raw_uid, list) or len(raw_uid) < 2:
+                return
+            uid = (raw_uid[0], raw_uid[1])
             with self._lock:
                 applied = self._crdt.apply_delete(uid)
             if applied:
