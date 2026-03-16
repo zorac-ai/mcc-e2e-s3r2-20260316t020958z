@@ -25,6 +25,10 @@ from typing import Any
 
 from .crdt import RGA, Atom
 
+# ── HTTP request limits ───────────────────────────────────────────────────────
+
+_MAX_HTTP_REQUEST_SIZE = 16_384  # 16 KB
+
 # ── WebSocket constants ───────────────────────────────────────────────────────
 
 _WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -331,10 +335,20 @@ function renderCursors() {
   for (const [cid, info] of Object.entries(remoteCursors)) {
     const el = document.createElement('div');
     el.className = 'cursor-entry';
-    el.innerHTML =
-      `<div class="cursor-dot" style="background:${info.color}"></div>` +
-      `<div><div class="cursor-label">${info.name}</div>` +
-      `<div class="cursor-info">位置: ${info.pos}</div></div>`;
+    const dot = document.createElement('div');
+    dot.className = 'cursor-dot';
+    dot.style.background = info.color;
+    const inner = document.createElement('div');
+    const nameEl = document.createElement('div');
+    nameEl.className = 'cursor-label';
+    nameEl.textContent = info.name;
+    const posEl = document.createElement('div');
+    posEl.className = 'cursor-info';
+    posEl.textContent = `位置: ${info.pos}`;
+    inner.appendChild(nameEl);
+    inner.appendChild(posEl);
+    el.appendChild(dot);
+    el.appendChild(inner);
     cursList.appendChild(el);
   }
 }
@@ -407,6 +421,7 @@ class CollabServer:
         self.port = port
         self._crdt = RGA("server")
         self._clients: dict[str, socket.socket] = {}
+        self._client_send_locks: dict[str, threading.Lock] = {}
         self._cursors: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
@@ -436,12 +451,17 @@ class CollabServer:
         frame = _make_frame(_OP_TEXT, json.dumps(msg).encode())
         dead: list[str] = []
         with self._lock:
-            targets = list(self._clients.items())
-        for cid, sock in targets:
+            targets = [
+                (cid, sock, self._client_send_locks[cid])
+                for cid, sock in self._clients.items()
+                if cid in self._client_send_locks
+            ]
+        for cid, sock, send_lock in targets:
             if cid == exclude:
                 continue
             try:
-                sock.sendall(frame)
+                with send_lock:
+                    sock.sendall(frame)
             except OSError:
                 dead.append(cid)
         for cid in dead:
@@ -451,27 +471,33 @@ class CollabServer:
         frame = _make_frame(_OP_TEXT, json.dumps(msg).encode())
         with self._lock:
             sock = self._clients.get(client_id)
-        if sock:
+            send_lock = self._client_send_locks.get(client_id)
+        if sock and send_lock:
             try:
-                sock.sendall(frame)
+                with send_lock:
+                    sock.sendall(frame)
             except OSError:
                 self._drop_client(client_id)
 
     def _drop_client(self, client_id: str) -> None:
         with self._lock:
             self._clients.pop(client_id, None)
+            self._client_send_locks.pop(client_id, None)
             self._cursors.pop(client_id, None)
         self._broadcast({"type": "cursor_remove", "client_id": client_id})
 
     # ── HTTP / WebSocket upgrade ──────────────────────────────────────────
 
     def _read_http_request(self, conn: socket.socket) -> bytes:
+        conn.settimeout(10.0)
         buf = b""
         while b"\r\n\r\n" not in buf:
             chunk = conn.recv(4096)
             if not chunk:
                 break
             buf += chunk
+            if len(buf) > _MAX_HTTP_REQUEST_SIZE:
+                break
         return buf
 
     def _handle_conn(self, conn: socket.socket) -> None:
@@ -505,6 +531,7 @@ class CollabServer:
                 client_id = str(uuid.uuid4())
                 with self._lock:
                     self._clients[client_id] = conn
+                    self._client_send_locks[client_id] = threading.Lock()
                 self._on_ws_open(client_id)
                 self._ws_loop(conn, client_id)
             else:
@@ -574,7 +601,14 @@ class CollabServer:
         kind = msg.get("type")
 
         if kind == "insert":
-            atom = Atom.from_dict(msg["atom"])
+            atom_dict = dict(msg["atom"])
+            # Validate char: must be exactly one character
+            char = atom_dict.get("char", "")
+            if not isinstance(char, str) or len(char) != 1:
+                return
+            # Override site_id with the authenticated client_id to prevent spoofing
+            atom_dict["site_id"] = client_id
+            atom = Atom.from_dict(atom_dict)
             with self._lock:
                 applied = self._crdt.apply_insert(atom)
             if applied:
