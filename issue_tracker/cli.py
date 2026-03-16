@@ -25,6 +25,13 @@ def build_parser() -> argparse.ArgumentParser:
     close_parser = subparsers.add_parser("close", help="Close an issue")
     close_parser.add_argument("issue_id", type=int)
 
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start a real-time collaborative editing server (WebSocket + CRDT)",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
+    serve_parser.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+
     # MCC-LIVE-E2E: parser anchor
 
     return parser
@@ -41,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
         result = store.list(status=args.status)
     elif args.command == "close":
         result = store.close(args.issue_id)
+    elif args.command == "serve":
+        from .collab import CollabServer
+        server = CollabServer(host=args.host, port=args.port)
+        server.start()
+        return 0
     # MCC-LIVE-E2E: command anchor
     else:
         parser.error(f"unknown command: {args.command}")
