@@ -11,7 +11,7 @@ import time
 import unittest
 
 from issue_tracker.crdt import RGA, Atom
-from issue_tracker.collab import CollabServer, _parse_frame, _make_frame
+from issue_tracker.collab import CollabServer, _parse_frame, _make_frame, _OP_PONG
 
 
 # ── CRDT unit tests ───────────────────────────────────────────────────────────
@@ -257,6 +257,38 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
+def _ws_send_ping(sock: socket.socket, payload: bytes = b"") -> None:
+    """Send a masked WebSocket PING frame (client → server)."""
+    mask_key = os.urandom(4)
+    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    # FIN(0x80) | PING(0x09) = 0x89; MASK(0x80) | len
+    header = bytes([0x89, 0x80 | len(payload)])
+    sock.sendall(header + mask_key + masked)
+
+
+def _ws_recv_raw_frame(
+    sock: socket.socket,
+    timeout: float = 3.0,
+    *,
+    buf: bytes = b"",
+) -> tuple[int, bytes, bytes]:
+    """Receive one WebSocket frame without JSON-decoding.
+
+    Returns ``(opcode, payload, remaining_buf)`` where *remaining_buf* holds any
+    bytes read from the socket that belong to subsequent frames.  Pass it back as
+    *buf* on the next call so those bytes are not lost.
+    """
+    sock.settimeout(timeout)
+    while True:
+        op, payload, consumed = _parse_frame(buf)
+        if consumed > 0:
+            return op, payload, buf[consumed:]
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("Socket closed before frame received")
+        buf += chunk
+
+
 class TestCollabServer(unittest.TestCase):
 
     @classmethod
@@ -404,6 +436,101 @@ class TestCollabServer(unittest.TestCase):
         self.assertIn(b"200 OK", response)
         self.assertIn(b"text/html", response)
         self.assertIn(b"WebSocket", response)
+
+
+    def test_ping_pong_send_lock_concurrent(self) -> None:
+        """PONG is sent under send_lock in _ws_loop; concurrent PINGs don't corrupt frames."""
+        # Basic: single PING must receive a PONG with the original payload echoed back.
+        sock, lo = self._client()
+        try:
+            _ws_recv(sock, buf=lo)  # drain init
+            ping_payload = b"keepalive"
+            _ws_send_ping(sock, ping_payload)
+            opcode, pong_payload, _ = _ws_recv_raw_frame(sock)
+            self.assertEqual(opcode, _OP_PONG)
+            self.assertEqual(pong_payload, ping_payload)
+        finally:
+            sock.close()
+
+        # Concurrent: NUM_CLIENTS clients each send NUM_PINGS PINGs simultaneously on a
+        # dedicated server so broadcasts from unrelated clients don't interfere.
+        # Every PONG must echo the correct payload, confirming send_lock prevents
+        # frame interleaving between concurrent writers on the same socket.
+        dedicated_port = _find_free_port()
+        dedicated_server = CollabServer(host="127.0.0.1", port=dedicated_port)
+        srv_thread = threading.Thread(target=dedicated_server.start, daemon=True)
+        srv_thread.start()
+        time.sleep(0.1)  # wait for server to bind
+
+        NUM_CLIENTS = 5
+        NUM_PINGS = 10
+        errors: list[str] = []
+        err_lock = threading.Lock()
+
+        def worker() -> None:
+            s, lo = _ws_connect("127.0.0.1", dedicated_port)
+            try:
+                _ws_recv(s, buf=lo)  # drain init (discards leftover; see below)
+                remainder: bytes = b""
+                for i in range(NUM_PINGS):
+                    p = f"p{i}".encode()
+                    _ws_send_ping(s, p)
+                    # Drain any interleaved text frames (e.g. cursor_remove broadcasts
+                    # when other workers disconnect); only validate PONG frames.
+                    # Thread *remainder* so no bytes between frames are lost.
+                    while True:
+                        op, resp, remainder = _ws_recv_raw_frame(s, buf=remainder)
+                        if op == _OP_PONG:
+                            break
+                    if resp != p:
+                        with err_lock:
+                            errors.append(f"Payload mismatch: {resp!r} != {p!r}")
+            except Exception as e:  # noqa: BLE001
+                with err_lock:
+                    errors.append(str(e))
+            finally:
+                s.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(NUM_CLIENTS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15.0)
+
+        self.assertEqual(errors, [], f"Concurrent PING errors: {errors}")
+
+    def test_delete_invalid_uid_no_crash(self) -> None:
+        """delete with invalid uid must not raise IndexError/TypeError or crash handler."""
+        sock, lo = self._client()
+        try:
+            _ws_recv(sock, buf=lo)  # drain init
+
+            # Each of these should be silently ignored by _handle_msg, not crash.
+            invalid_uids = [
+                [],           # empty list → IndexError on [0] without guard
+                [1],          # single-element list → IndexError on [1] without guard
+                "not-a-list", # str → TypeError on subscript without isinstance check
+                42,           # int → TypeError without isinstance check
+                {},           # dict → TypeError without isinstance check
+                None,         # None → TypeError without isinstance check
+            ]
+            for uid in invalid_uids:
+                _ws_send(sock, {"type": "delete", "uid": uid})
+
+            time.sleep(0.1)  # give server time to process all messages
+
+            # The handler thread must still be alive: a valid cursor message should work,
+            # and a brand-new client must be able to connect and receive an init message.
+            _ws_send(sock, {"type": "cursor", "cursor": {"pos": 0}})
+
+            c2, lo2 = self._client()
+            try:
+                msg = _ws_recv(c2, buf=lo2)
+                self.assertEqual(msg["type"], "init")
+            finally:
+                c2.close()
+        finally:
+            sock.close()
 
 
 if __name__ == "__main__":
